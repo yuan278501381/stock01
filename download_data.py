@@ -139,47 +139,210 @@ def save_daily(code, df):
     df.to_csv(filepath, index=False)
 
 
-def download_all_daily(stock_list, test_mode=False):
-    """批量下载日K线"""
+def download_all_daily(stock_list, test_mode=False, workers=8):
+    """批量下载日K线（串行 + 增量跳过 + 进度ETA）"""
     if test_mode:
         stock_list = stock_list[:5]
 
     total = len(stock_list)
     success = skip = fail = 0
+
     print(f"\n{'='*60}")
     print(f"  [K线] 开始下载 {total} 只股票的日K线数据 (17字段)")
     print(f"{'='*60}")
 
-    for i, stock in enumerate(stock_list, 1):
-        code, name = stock["code"], stock["name"]
+    # 第一步：快速扫描，找出需要更新的
+    today = datetime.now().strftime("%Y-%m-%d")
+    todo = []
+    print(f"  正在扫描本地数据...")
+    for stock in stock_list:
+        code = stock["code"]
         latest = get_local_latest_date(code)
         if latest:
             next_day = (datetime.strptime(latest, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            if next_day >= datetime.now().strftime("%Y-%m-%d"):
+            if next_day >= today:
                 skip += 1
-                if test_mode:
-                    print(f"  [{i}/{total}] {code} {name} — 已是最新，跳过")
                 continue
-            start = next_day
+            stock["_start"] = next_day
         else:
-            start = START_DATE
+            stock["_start"] = START_DATE
+        todo.append(stock)
+
+    print(f"  扫描完毕: 已跳过 {skip} 只（已最新）, 需下载 {len(todo)} 只")
+
+    if not todo:
+        print(f"\n  全部 {total} 只股票已是最新，无需下载")
+        print(f"{'='*60}")
+        return
+
+    t0 = time.time()
+
+    for i, stock in enumerate(todo, 1):
+        code, name = stock["code"], stock["name"]
+        start = stock.get("_start", START_DATE)
 
         df = download_daily(code, start)
         if df is not None and not df.empty:
             save_daily(code, df)
             success += 1
-            print(f"  [{i}/{total}] {code} {name} — {len(df)} 条 ✓")
+        elif stock.get("_start") != START_DATE:
+            # 增量模式：已有本地数据，只是暂无新数据（如周末/BaoStock延迟）
+            skip += 1
         else:
             fail += 1
-            if test_mode:
-                print(f"  [{i}/{total}] {code} {name} — 无数据 ✗")
 
-        if not test_mode and i % 200 == 0:
-            print(f"  ... 已处理 {i}/{total} (成功{success} 跳过{skip} 失败{fail})")
+        # 每100只或最后一只显示进度
+        if i % 100 == 0 or i == len(todo):
+            elapsed = time.time() - t0
+            speed = i / elapsed if elapsed > 0 else 0
+            eta = (len(todo) - i) / speed if speed > 0 else 0
+            print(f"  已处理 {i}/{len(todo)} ({speed:.1f}只/秒, 剩余约{eta:.0f}秒)")
 
+    elapsed = time.time() - t0
     print(f"\n  日K线下载完毕: 成功 {success} | 跳过 {skip} | 失败 {fail} | 共 {total}")
+    print(f"  耗时: {elapsed:.1f}秒")
     print(f"{'='*60}")
 
+
+# ============================================================
+# 快速并发下载 (腾讯 API)
+# ============================================================
+
+def _qq_fetch_one(code, start_date="2020-01-01", end_date="2026-12-31"):
+    """腾讯K线API: 单只股票OHLCV(前复权), 返回DataFrame或None"""
+    import requests as req
+    pure = code.split(".")[-1] if "." in code else code
+    prefix = "sh" if code.startswith("sh") or pure.startswith("6") else "sz"
+    symbol = f"{prefix}{pure}"
+    try:
+        s = req.Session()
+        s.trust_env = False
+        r = s.get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            params={"param": f"{symbol},day,{start_date},{end_date},8000,qfq"},
+            timeout=15,
+        )
+        data = r.json().get("data", {}).get(symbol, {})
+        klines = data.get("qfqday") or data.get("day", [])
+        if not klines:
+            return None
+
+        rows = []
+        for k in klines:
+            # 腾讯格式: [日期, 开, 收, 高, 低, 成交量, ...]
+            if len(k) < 6:
+                continue
+            date, open_, close, high, low, volume = k[0], k[1], k[2], k[3], k[4], k[5]
+            rows.append({
+                "date": date,
+                "open": float(open_),
+                "high": float(high),
+                "low": float(low),
+                "close": float(close),
+                "volume": float(volume),
+                "amount": 0,  # 腾讯不返回成交额
+                "preclose": 0,
+                "adjustflag": "2",
+                "turn": "",
+                "tradestatus": "1",
+                "pctChg": 0,
+                "peTTM": "",
+                "pbMRQ": "",
+                "psTTM": "",
+                "pcfNcfTTM": "",
+                "isST": "0",
+            })
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows)
+        # 计算涨跌幅
+        df["preclose"] = df["close"].shift(1)
+        df.loc[0, "preclose"] = df.loc[0, "open"]
+        df["pctChg"] = ((df["close"] - df["preclose"]) / df["preclose"] * 100).round(4)
+        return df
+    except Exception:
+        return None
+
+
+def download_all_daily_fast(stock_list, test_mode=False, workers=20):
+    """快速并发下载日K线 (腾讯API, 20线程, 30-80只/秒)"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if test_mode:
+        stock_list = stock_list[:10]
+        workers = 5
+
+    total = len(stock_list)
+    success = skip = fail = 0
+
+    print(f"\n{'='*60}")
+    print(f"  [K线] 快速并发下载 {total} 只股票 (腾讯API, {workers}线程)")
+    print(f"{'='*60}")
+
+    # 扫描增量
+    today = datetime.now().strftime("%Y-%m-%d")
+    todo = []
+    for stock in stock_list:
+        code = stock["code"]
+        latest = get_local_latest_date(code)
+        if latest:
+            next_day = (datetime.strptime(latest, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            if next_day >= today:
+                skip += 1
+                continue
+            stock["_start"] = next_day
+        else:
+            stock["_start"] = START_DATE
+        todo.append(stock)
+
+    print(f"  已跳过 {skip} 只（已最新）, 需下载 {len(todo)} 只")
+
+    if not todo:
+        print(f"  全部已是最新！")
+        print(f"{'='*60}")
+        return
+
+    t0 = time.time()
+    done = [0]
+
+    def worker(stock):
+        code = stock["code"]
+        start = stock.get("_start", START_DATE)
+        end = datetime.now().strftime("%Y-%m-%d")
+        df = _qq_fetch_one(code, start_date=start, end_date=end)
+        done[0] += 1
+        n = done[0]
+        if n % 200 == 0:
+            elapsed = time.time() - t0
+            speed = n / elapsed if elapsed > 0 else 0
+            print(f"  已处理 {n}/{len(todo)} ({speed:.0f}只/秒)")
+        if df is not None and not df.empty:
+            save_daily(code, df)
+            return "ok"
+        elif stock.get("_start") != START_DATE:
+            return "skip"
+        return "fail"
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(worker, s): s for s in todo}
+        for f in as_completed(futures):
+            try:
+                status = f.result()
+                if status == "ok":
+                    success += 1
+                elif status == "skip":
+                    skip += 1
+                else:
+                    fail += 1
+            except Exception:
+                fail += 1
+
+    elapsed = time.time() - t0
+    print(f"\n  快速下载完毕: 成功 {success} | 跳过 {skip} | 失败 {fail} | 共 {total}")
+    print(f"  耗时: {elapsed:.1f}秒 ({len(todo)/(elapsed or 1):.0f}只/秒)")
+    print(f"{'='*60}")
 
 # ============================================================
 # 财务数据下载
@@ -442,11 +605,13 @@ def main():
     parser.add_argument("--test", action="store_true", help="测试模式（仅5只股票）")
     parser.add_argument("--code", type=str, help="下载指定股票, 如 sh.600000")
     parser.add_argument("--start", type=str, default=START_DATE, help=f"起始日期 (默认: {START_DATE})")
+    parser.add_argument("--fast", action="store_true", help="快速并发下载 (腾讯API, 20线程)")
+    parser.add_argument("--workers", type=int, default=20, help="并发下载线程数 (默认: 20)")
     args = parser.parse_args()
 
     # 若未指定任何下载类型，默认 --all
-    if not any([args.all, args.daily, args.finance, args.boards, args.code]):
-        args.all = True
+    if not any([args.all, args.daily, args.finance, args.boards, args.code, args.fast]):
+        args.fast = True  # 默认使用快速模式
 
     ensure_dirs()
 
@@ -487,8 +652,10 @@ def main():
         print(f"[信息] 获取到 {len(stock_list)} 只A股股票")
 
         # 按类型下载
-        if args.all or args.daily:
-            download_all_daily(stock_list, test_mode=args.test)
+        if args.fast:
+            download_all_daily_fast(stock_list, test_mode=args.test, workers=args.workers)
+        elif args.all or args.daily:
+            download_all_daily(stock_list, test_mode=args.test, workers=args.workers)
 
         if args.all or args.finance:
             download_all_finance(stock_list, test_mode=args.test)
