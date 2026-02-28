@@ -9,6 +9,26 @@ venv/
 env/
 .env
 
+# Ignore sensitive config
+config.json
+
+# Ignore data files
+*.csv
+data/
+*.db
+*.sqlite3
+
+# Ignore temporary/log files
+*.log
+*.tmp
+*.txt
+
+
+# Ignore virtual environments
+venv/
+env/
+.env
+
 # Ignore data files
 *.csv
 data/

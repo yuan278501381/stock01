@@ -40,7 +40,53 @@ DAILY_DIR = os.path.join(BASE_DIR, "data", "daily")
 FINANCE_DIR = os.path.join(BASE_DIR, "data", "finance")
 BOARDS_DIR = os.path.join(BASE_DIR, "data", "boards")
 
+# 加载外部配置（API Key 等）
+import json as _json
+_CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+_CONFIG = {}
+if os.path.exists(_CONFIG_FILE):
+    try:
+        with open(_CONFIG_FILE, "r", encoding="utf-8") as _f:
+            _CONFIG = _json.load(_f)
+    except Exception:
+        pass
+GEMINI_API_KEY = _CONFIG.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+
+
 MIN_ROWS = 60  # 最少数据行数
+
+# ============================================================
+# 消息面 — 金融情感词典
+# ============================================================
+# 重大利好：标题匹配即得高分
+NEWS_MAJOR_POS = [
+    "中标", "大合同", "战略合作协议", "股权激励", "回购",
+    "增持", "高送转", "并购", "重组", "业绩超预期",
+    "首次盈利", "扭亏", "获批", "上市许可", "垄断企业",
+    "获得专利", "技术突破", "战略投资", "入股",
+]
+# 普通正面新闻
+NEWS_MINOR_POS = [
+    "合作", "签约", "中选", "新客户", "扩产", "新订单",
+    "业绩增长", "净利润增长", "营收增长", "新产品",
+    "降本增效", "份额提升", "加大投入",
+    "龙虎榜", "涨停", "大幅上涨", "主力资金流入", "获机构重点关注",
+    "创近期新高",
+]
+# 重大利空：标题匹配即扣高分
+NEWS_MAJOR_NEG = [
+    "亏损预告", "业绩大幅下滑", "行政处罚", "被调查", "立案",
+    "违规", "诉讼", "仲裁", "财务造假", "强制退市",
+    "债务违约", "股权冻结", "大规模裁员", "停产",
+    "退市风险", "被ST", "欺诈发行",
+]
+# 普通负面新闻
+NEWS_MINOR_NEG = [
+    "减持", "解禁", "下调评级", "业绩下滑", "竞争加剧",
+    "产能过剩", "客户流失", "亏损", "计提减值", "商誉减值",
+]
+
+
 
 
 # ============================================================
@@ -671,7 +717,208 @@ def score_flow(df, flow_data=None):
     return max(-15, min(15, score)), signals
 
 
-# ============================================================
+def fetch_news(code, name, days=7):
+    """获取个股近N天的专属新闻（含时间衰减权重）
+
+    Returns: list of dict {title, time, weight}
+    """
+    try:
+        import akshare as ak
+        from datetime import datetime, timedelta
+        pure = code.split(".")[-1] if "." in code else code
+        df = ak.stock_news_em(symbol=pure)
+        if df is None or df.empty:
+            return []
+
+        # 字段标准化
+        col_time = next((c for c in df.columns if "时间" in c or "日期" in c), None)
+        col_title = next((c for c in df.columns if "标题" in c), None)
+        col_content = next((c for c in df.columns if "内容" in c), None)
+        if not col_time or not col_title:
+            return []
+
+        cutoff = datetime.now() - timedelta(days=days)
+        items = []
+        for _, row in df.iterrows():
+            t_str = str(row[col_time])[:16]
+            try:
+                t = datetime.strptime(t_str, "%Y-%m-%d %H:%M")
+            except Exception:
+                try:
+                    t = datetime.strptime(t_str[:10], "%Y-%m-%d")
+                except Exception:
+                    continue
+            if t < cutoff:
+                continue
+
+            title = str(row[col_title])
+            col_source = next((c for c in df.columns if "来源" in c), None)
+            source = str(row.get(col_source, "")) if col_source else ""
+
+            # 严格过滤：标题必须含股票名或代码，或者来源是公司公告
+            is_company_ann = any(x in source for x in ["公告", "披露", "交易所"])
+            if name and name not in title and pure not in title and not is_company_ann:
+                continue
+
+            # 时间衰减权重
+            age_days = (datetime.now() - t).total_seconds() / 86400
+            if age_days < 1:
+                weight = 1.0
+            elif age_days < 2:
+                weight = 0.8
+            elif age_days < 3:
+                weight = 0.6
+            elif age_days < 5:
+                weight = 0.4
+            else:
+                weight = 0.2
+
+            items.append({"title": title, "time": t_str, "weight": weight})
+
+        return items
+    except Exception:
+        return []
+
+
+def analyze_news_with_gemini(stock_name, stock_code, industry, news_items):
+    """将全量新闻发给 Gemini 做语义情感分析，返回 (score: int, reasoning: str)
+
+    score 范围: -15 ~ +15
+    考虑因素: 新闻实质内容、行业关联事件、时间衰减（越新越重要）
+    """
+    if not GEMINI_API_KEY or not news_items:
+        return None, ""
+    try:
+        from google import genai
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        # 构建新闻列表文本，按时间倒序（越新越靠前）
+        news_text = ""
+        for item in sorted(news_items, key=lambda x: x["time"], reverse=True):
+            decay_label = {1.0: "今日", 0.8: "昨日", 0.6: "2天前", 0.4: "3-4天前"}.get(
+                item["weight"], "更早"
+            )
+            news_text += f"[{decay_label} {item['time'][:10]}] {item['title']}\n"
+
+        prompt = f"""你是A股专业投资分析师。请分析以下关于"{stock_name}"({stock_code}, 行业:{industry})的近期新闻，\
+评估其对该股票**短期（1-5个交易日）**股价的影响。
+
+## 新闻列表（越靠前越新，权重越高）
+{news_text}
+
+## 评分规则
+- 分析每条新闻对该公司的**实质性**影响
+- 考虑行业关联事件（如供应链伙伴、竞争对手、政策变化对该行业的影响）
+- 越新的消息影响越大
+- 综合给出 -15 到 +15 的整数评分，格式如下：
+
+SCORE: <整数>
+REASON: <1-2句中文说明，重点讲最有影响力的1-2条新闻>"""
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+        text = response.text.strip()
+
+        # 解析分数
+        score = 0
+        reason = ""
+        for line in text.splitlines():
+            if line.startswith("SCORE:"):
+                try:
+                    score = int(line.replace("SCORE:", "").strip())
+                    score = max(-15, min(15, score))
+                except Exception:
+                    pass
+            elif line.startswith("REASON:"):
+                reason = line.replace("REASON:", "").strip()
+
+        return score, reason
+    except Exception as e:
+        return None, str(e)[:60]
+
+
+def score_news(news_items, stock_name="", stock_code="", industry=""):
+    """消息面评分 (±15)
+
+    优先路径: Gemini 全量语义分析（有 API key 时）
+    退化路径: 金融关键词词典 + 时间衰减
+    """
+    if not news_items:
+        return 0, []
+
+    signals = []
+
+    # ============ 路径 A: Gemini 语义分析 ============
+    if GEMINI_API_KEY:
+        gemini_score, reason = analyze_news_with_gemini(
+            stock_name, stock_code, industry, news_items
+        )
+        if gemini_score is not None:
+            final = gemini_score
+            tag = "Gemini分析"
+            if final > 0:
+                signals.append(f"[{tag}] 消息面正面 {final:+d}分 | {reason}")
+            elif final < 0:
+                signals.append(f"[{tag}] 消息面负面 {final:+d}分 | {reason}")
+            else:
+                signals.append(f"[{tag}] 消息面中性 0分 | {reason}")
+            # 附最新3条标题
+            for item in sorted(news_items, key=lambda x: x["time"], reverse=True)[:3]:
+                t = item["time"][:10]
+                signals.append(f"  [{t}] {item['title'][:40]}")
+            return final, signals
+
+    # ============ 路径 B: 关键词词典（兜底）============
+    score = 0.0
+    matched_titles = []
+
+    for item in news_items:
+        title = item["title"]
+        w = item["weight"]
+        t = item["time"]
+
+        for kw in NEWS_MAJOR_POS:
+            if kw in title:
+                score += 8 * w
+                signals.append(f"【利好】{kw}: {title[:25]}... (权重{w:.1f})")
+                matched_titles.append(f"↑ {t[:10]} {title[:35]}")
+                break
+
+        for kw in NEWS_MAJOR_NEG:
+            if kw in title:
+                score -= 8 * w
+                signals.append(f"【利空】{kw}: {title[:25]}... (权重{w:.1f})")
+                matched_titles.append(f"↓ {t[:10]} {title[:35]}")
+                break
+
+        for kw in NEWS_MINOR_POS:
+            if kw in title:
+                score += 3 * w
+                matched_titles.append(f"+ {t[:10]} {title[:35]}")
+                break
+
+        for kw in NEWS_MINOR_NEG:
+            if kw in title:
+                score -= 3 * w
+                matched_titles.append(f"- {t[:10]} {title[:35]}")
+                break
+
+    final = int(max(-15, min(15, score)))
+    if final > 0:
+        signals.append(f"[词典] 消息面正面 {final:+d}分，{len(news_items)}条新闻")
+    elif final < 0:
+        signals.append(f"[词典] 消息面负面 {final:+d}分，{len(news_items)}条新闻")
+    else:
+        signals.append(f"[词典] 消息面中性 0分，{len(news_items)}条新闻")
+    for t in matched_titles[:3]:
+        signals.append(f"  {t}")
+
+    return final, signals
+
+
+
 # 板块信息
 # ============================================================
 
@@ -793,18 +1040,18 @@ def get_stock_boards(code):
 def _print_stock_list(tag, title, stock_list, top_n):
     """打印荐1股列表（含名称和板块信息）"""
     print(f"\n{'='*120}")
-    print(f"  [{tag}] {title} TOP {top_n} (七维度综合评分)")
-    print(f"{'='*120}")
+    print(f"  [{tag}] {title} TOP {top_n} (八维度综合评分)")
+    print(f"{'='*130}")
     print(f"  {'#':<3} {'代码':<12} {'名称':<10} {'收盘':>8} {'涨跌%':>7}"
           f" {'总分':>5} {'技术':>5} {'估值':>5} {'基本':>5} {'风险':>5}"
-          f" {'动量':>5} {'资金':>5} {'热度':>5} {'建议'}")
-    print(f"  {'-'*115}")
+          f" {'动量':>5} {'资金':>5} {'消息':>5} {'热度':>5} {'建议'}")
+    print(f"  {'-'*125}")
     for i, r in enumerate(stock_list, 1):
         name = r.get('name', '')[:8]
         print(f"  {i:<3} {r['code']:<12} {name:<10} {r['close']:>8.2f} {r['pctChg']:>6.2f}%"
               f" {r['total_score']:>+5} {r['tech_score']:>+5} {r['val_score']:>+5}"
               f" {r['fund_score']:>+5} {r['risk_score']:>5}"
-              f" {r['mom_score']:>+5} {r['flow_score']:>+5} {r.get('heat_score',0):>+5} {r['action']}")
+              f" {r['mom_score']:>+5} {r['flow_score']:>+5} {r.get('news_score',0):>+5} {r.get('heat_score',0):>+5} {r['action']}")
         print(f"      [{r.get('board','?')}] 行业:{r.get('industry','-')}"
               f"  概念:{r.get('concept','-')}"
               f"  地区:{r.get('region','-')}")
@@ -849,8 +1096,8 @@ def get_all_downloaded_codes():
     return sorted(codes)
 
 
-def evaluate_single(code, verbose=False, flow_data=None):
-    """七维度综合评估单只股票"""
+def evaluate_single(code, verbose=False, flow_data=None, news_data=None):
+    """八维度综合评估单只股票"""
     df = load_daily_data(code)
     if df is None or len(df) < MIN_ROWS:
         return None
@@ -858,7 +1105,7 @@ def evaluate_single(code, verbose=False, flow_data=None):
     df = calc_all_indicators(df)
     latest = df.iloc[-1]
 
-    # 七维度评分
+    # 八维度评分
     tech_score, tech_signals = score_technical(df)
     val_score, val_signals = score_valuation(latest)
     fund_score, fund_signals = score_fundamental(code)
@@ -866,23 +1113,30 @@ def evaluate_single(code, verbose=False, flow_data=None):
     mom_score, mom_signals = score_momentum(df)
     flow_score, flow_signals = score_flow(df, flow_data=flow_data)
 
-    total = tech_score + val_score + fund_score + risk_score + mom_score + flow_score
+    # 板块信息（先加载，供消息面分析使用）
+    boards = get_stock_boards(code)
+    _name = boards.get("_name", "") or code
+    _industry = boards.get("industry", "") or ""
+    news_score, news_signals = score_news(
+        news_data or [],
+        stock_name=_name,
+        stock_code=code,
+        industry=_industry,
+    )
+
+    total = tech_score + val_score + fund_score + risk_score + mom_score + flow_score + news_score
     # heat_score 在 main() 批量评估后注入
 
-    # 生成建议 (阈值适配七维度总分范围)
-    if total >= 60:
+    if total >= 65:
         action = "** 强烈买入"
     elif total >= 30:
         action = "*  建议买入"
-    elif total <= -40:
+    elif total <= -45:
         action = "** 强烈卖出"
     elif total <= -15:
         action = "*  建议卖出"
     else:
         action = "-  观望"
-
-    # 板块信息
-    boards = get_stock_boards(code)
 
     result = {
         "code": code,
@@ -898,6 +1152,7 @@ def evaluate_single(code, verbose=False, flow_data=None):
         "risk_score": risk_score,
         "mom_score": mom_score,
         "flow_score": flow_score,
+        "news_score": news_score,
         "heat_score": 0,
         "action": action,
         "tech_signals": tech_signals,
@@ -906,6 +1161,7 @@ def evaluate_single(code, verbose=False, flow_data=None):
         "risk_signals": risk_signals,
         "mom_signals": mom_signals,
         "flow_signals": flow_signals,
+        "news_signals": news_signals,
         "heat_signals": [],
         "industry": boards["industry"],
         "concept": boards["concept"],
@@ -938,13 +1194,13 @@ def print_detail_report(result):
     print(f"  技术面: {result['tech_score']:>+4}/40  |  估值面: {result['val_score']:>+4}/25  |"
           f"  基本面: {result['fund_score']:>+4}/25  |  风险面: {result['risk_score']:>+3}/10")
     print(f"  动量面: {result['mom_score']:>+4}/15  |  资金面: {result['flow_score']:>+4}/15  |"
-          f"  热度面: {result['heat_score']:>+4}/10  |")
+          f"  消息面: {result.get('news_score',0):>+4}/15  |  热度面: {result['heat_score']:>+4}/10  |")
     print(f"  {'-'*76}")
 
     for label, key in [("技术面", "tech_signals"), ("估值面", "val_signals"),
                        ("基本面", "fund_signals"), ("风险面", "risk_signals"),
                        ("动量面", "mom_signals"), ("资金面", "flow_signals"),
-                       ("热度面", "heat_signals")]:
+                       ("消息面", "news_signals"), ("热度面", "heat_signals")]:
         sigs = result[key]
         if sigs:
             print(f"  {label}:")
@@ -994,9 +1250,12 @@ def main():
 
     if args.code:
         flow = fetch_capital_flow(args.code)
-        result = evaluate_single(args.code, verbose=True, flow_data=flow)
+        _tmp = get_stock_boards(args.code)
+        _name = _tmp.get("_name", "") or ""
+        news = fetch_news(args.code, _name)
+        result = evaluate_single(args.code, verbose=True, flow_data=flow, news_data=news)
         if result:
-            result["_flow_detail"] = flow  # 传给详细报告展示
+            result["_flow_detail"] = flow
             print_detail_report(result)
         else:
             print(f"[信息] 无法评估 {args.code}（数据不足或不存在）")
@@ -1054,6 +1313,12 @@ def main():
 
     # ---- 板块热度后处理 ----
     _apply_sector_heat(results)
+
+    # ---- Gemini 综合情报分析（取代逐股分析） ----
+    active_concepts = args.concept or []
+    if active_concepts:
+        from market_intel import enrich_with_intel
+        enrich_with_intel(results, active_concepts, top_n=args.top)
 
     # 概念筛选模式: 对已预筛选的结果做 alpha 排名
     if args.concept:
